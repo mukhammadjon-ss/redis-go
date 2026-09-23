@@ -1,7 +1,5 @@
 # Redis Clone in Go
 
-A Redis-compatible server written from scratch in Go, built through the [CodeCrafters "Build Your Own Redis"](https://codecrafters.io/challenges/redis) challenge.
-
 It speaks the RESP protocol, so the standard `redis-cli` and any Redis client library can talk to it. The project is also a vehicle for learning Go concurrency properly: every feature below was chosen to exercise a real concurrency problem (shared state, background work, cancellation, and cross-connection signalling).
 
 ## Quick start
