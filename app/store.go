@@ -2,15 +2,23 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"sync"
 	"time"
+)
+
+var (
+	ErrWrongType  = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
+	ErrIDZero     = errors.New("ERR The ID specified in XADD must be greater than 0-0")
+	ErrIDTooSmall = errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 )
 
 type entry struct {
 	kind      string
 	value     string
 	list      []string
+	stream    *Stream
 	expiresAt time.Time
 }
 
@@ -21,6 +29,20 @@ type store struct {
 	mu      sync.RWMutex
 	data    map[string]entry
 	waiters map[string][]chan popped
+}
+
+type StreamID struct {
+	Ms, Seq uint64
+}
+
+type StreamEntry struct {
+	ID     StreamID
+	Fields []string
+}
+
+type Stream struct {
+	Entries []StreamEntry
+	LastID  StreamID
 }
 
 func newStore() *store {
@@ -201,6 +223,34 @@ func (s *store) EntryType(key string) (string, bool) {
 	return e.kind, true
 }
 
+func (s *store) XAdd(key string, streamId StreamID, fields []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.data[key]
+
+	if !ok {
+		st = entry{kind: "stream", stream: &Stream{}}
+	}
+
+	if ok && st.kind != "stream" {
+		return ErrWrongType
+	}
+
+	if streamId.Ms == 0 && streamId.Seq == 0 {
+		return ErrIDZero
+	}
+
+	validSequance := isValidStreamId(st.stream.LastID, streamId)
+	if !validSequance {
+		return ErrIDTooSmall
+	}
+	st.stream.Entries = append(st.stream.Entries, StreamEntry{ID: streamId, Fields: fields})
+	st.stream.LastID = streamId
+	s.data[key] = st
+
+	return nil
+}
+
 func (s *store) cancelWait(keys []string, ch chan popped) (popped, bool) {
 	s.mu.Lock()
 	stillWaiting := s.removeWaiter(keys, ch)
@@ -261,4 +311,16 @@ func (s *store) evictExpired() {
 
 func (e entry) expired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
+}
+
+func isValidStreamId(lastId StreamID, newId StreamID) bool {
+	if newId.Ms < lastId.Ms {
+		return false
+	} else if newId.Ms == lastId.Ms {
+		if newId.Seq <= lastId.Seq {
+			return false
+		}
+	}
+
+	return true
 }

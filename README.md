@@ -36,6 +36,7 @@ go run -race ./app
 | `LPOP` | `LPOP key [count]` | bulk string, or array when `count` is given |
 | `BLPOP` | `BLPOP key [key ...] timeout` | `[key, value]` array, or null array (`*-1`) on timeout |
 | `TYPE` | `TYPE key` | `+string`, `+list`, or `+none` |
+| `XADD` | `XADD key streamID fields` | `streamID` or error message |
 
 ### Semantics worth knowing
 
