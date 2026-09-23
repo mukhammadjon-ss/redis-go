@@ -203,11 +203,70 @@ func handleClient(ctx context.Context, conn net.Conn, db *store) {
 			}
 
 			conn.Write([]byte("+" + p + "\r\n"))
+
+		case "XADD":
+			if len(cmd) < 5 || (len(cmd)-3)%2 != 0 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'XADD' command\r\n"))
+				continue
+			}
+
+			// streamId, err := parseID(string(cmd[2]))
+			if err != nil {
+				conn.Write([]byte("-ERR stream ID is invalid\r\n"))
+				continue
+			}
+
+			var fields []string
+
+			for _, v := range cmd[3:] {
+				fields = append(fields, string(v))
+			}
+			e, err := db.XAdd(string(cmd[1]), string(cmd[2]), fields)
+			if err != nil {
+				conn.Write([]byte("-" + err.Error() + "\r\n"))
+				continue
+			}
+
+			conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(e), e)))
+		case "XRANGE":
+			if len(cmd) < 4 {
+				conn.Write([]byte("-ERR wrong number of arguments for 'xrange' command\r\n"))
+				continue
+			}
+
+			key := string(cmd[1])
+			start := string(cmd[2])
+			end := string(cmd[3])
+
+			entries, err := db.XRange(key, start, end)
+			if err != nil {
+				conn.Write([]byte("-ERR " + err.Error() + "\r\n"))
+			}
+
+			writeStream(conn, entries)
 		default:
 			conn.Write([]byte("-ERR unknown command '" + string(cmd[0]) + "'\r\n"))
 		}
 	}
+}
 
+func writeStream(conn net.Conn, entries []StreamEntry) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(entries))
+
+	for _, e := range entries {
+		b.WriteString("*2\r\n")
+
+		id := e.ID.String()
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(id), id)
+
+		fmt.Fprintf(&b, "*%d\r\n", len(e.Fields))
+		for _, f := range e.Fields {
+			fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(f), f)
+		}
+	}
+
+	conn.Write([]byte(b.String()))
 }
 
 func writeArray(conn net.Conn, popped []string) {
@@ -265,6 +324,5 @@ func main() {
 			defer wg.Done()
 			handleClient(ctx, c, db)
 		}(conn)
-		// go handleClient(conn, db)
 	}
 }

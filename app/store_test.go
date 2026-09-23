@@ -291,7 +291,7 @@ func TestStoreXAdd(t *testing.T) {
 	t.Run("XAdd - wrong key", func(t *testing.T) {
 		s := newStore()
 		s.data["l"] = entry{kind: "string"}
-		err := s.XAdd("l", StreamID{1, 1}, []string{})
+		_, err := s.XAdd("l", "1-1", []string{})
 
 		if err == nil {
 			t.Errorf(`Type of Entry must be stream but got string`)
@@ -301,7 +301,7 @@ func TestStoreXAdd(t *testing.T) {
 	t.Run("XAdd - wrong type", func(t *testing.T) {
 		s := newStore()
 		s.data["l"] = entry{kind: "string"}
-		err := s.XAdd("l", StreamID{1, 1}, []string{})
+		_, err := s.XAdd("l", "1-1", []string{})
 
 		if !errors.Is(err, ErrWrongType) {
 			t.Errorf(`Type of Entry must be stream but got string`)
@@ -312,7 +312,7 @@ func TestStoreXAdd(t *testing.T) {
 		s := newStore()
 		// streamId := StreamID{Ms: 0, Seq: 0}
 		s.data["l"] = entry{kind: "stream", stream: &Stream{}}
-		err := s.XAdd("l", StreamID{0, 0}, []string{})
+		_, err := s.XAdd("l", "0-0", []string{})
 
 		if !errors.Is(err, ErrIDZero) {
 			t.Errorf(`Should get ErrIDZero but got %v`, err.Error())
@@ -323,9 +323,9 @@ func TestStoreXAdd(t *testing.T) {
 		s := newStore()
 		// streamId := StreamID{Ms: 0, Seq: 0}
 		s.data["l"] = entry{kind: "stream", stream: &Stream{}}
-		err := s.XAdd("l", StreamID{1, 1}, []string{})
-		err = s.XAdd("l", StreamID{1, 2}, []string{})
-		err = s.XAdd("l", StreamID{1, 1}, []string{})
+		_, err := s.XAdd("l", "1-1", []string{})
+		_, err = s.XAdd("l", "1-2", []string{})
+		_, err = s.XAdd("l", "1-1", []string{})
 		if !errors.Is(err, ErrIDTooSmall) {
 			t.Errorf(`Should get ErrIDZero but got %v`, err.Error())
 		}

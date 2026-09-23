@@ -3,7 +3,11 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"math"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -12,6 +16,7 @@ var (
 	ErrWrongType  = errors.New("WRONGTYPE Operation against a key holding the wrong kind of value")
 	ErrIDZero     = errors.New("ERR The ID specified in XADD must be greater than 0-0")
 	ErrIDTooSmall = errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+	ErrInvalidID  = errors.New("ERR Invalid stream ID specified as stream command argument")
 )
 
 type entry struct {
@@ -223,32 +228,104 @@ func (s *store) EntryType(key string) (string, bool) {
 	return e.kind, true
 }
 
-func (s *store) XAdd(key string, streamId StreamID, fields []string) error {
+func (s *store) XAdd(key string, rawID string, fields []string) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st, ok := s.data[key]
+
+	if ok && st.kind != "stream" {
+		return "", ErrWrongType
+	}
 
 	if !ok {
 		st = entry{kind: "stream", stream: &Stream{}}
 	}
 
-	if ok && st.kind != "stream" {
-		return ErrWrongType
+	lastID := st.stream.LastID
+	var streamId StreamID
+	var err error
+	switch {
+	case rawID == "*":
+		ms := uint64(time.Now().UnixMilli())
+
+		if ms < lastID.Ms {
+			ms = lastID.Ms
+		}
+
+		streamId = StreamID{Ms: ms, Seq: nextSeq(ms, lastID)}
+
+	case strings.HasSuffix(rawID, "-*"):
+		msStr, _, _ := strings.Cut(rawID, "-")
+		ms, err := strconv.ParseUint(msStr, 10, 64)
+		if err != nil {
+			return "", ErrInvalidID
+		}
+		streamId = StreamID{Ms: ms, Seq: nextSeq(ms, lastID)}
+
+	default:
+		streamId, err = parseID(rawID)
+
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if streamId.Ms == 0 && streamId.Seq == 0 {
-		return ErrIDZero
+		return "", ErrIDZero
 	}
 
 	validSequance := isValidStreamId(st.stream.LastID, streamId)
 	if !validSequance {
-		return ErrIDTooSmall
+		return "", ErrIDTooSmall
 	}
 	st.stream.Entries = append(st.stream.Entries, StreamEntry{ID: streamId, Fields: fields})
 	st.stream.LastID = streamId
 	s.data[key] = st
 
-	return nil
+	return streamId.String(), nil
+}
+
+func (s *store) XRange(key string, start string, end string) ([]StreamEntry, error) {
+	var startID StreamID
+	var endID StreamID
+	var err error
+	switch {
+	case start == "-":
+		startID = StreamID{Ms: 0, Seq: 0}
+	default:
+		startID, err = parseID(start)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	switch {
+	case end == "+":
+		endID = StreamID{Ms: math.MaxUint64, Seq: math.MaxUint64}
+	default:
+		endID, err = parseID(end)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	e, ok := s.data[key]
+	if !ok {
+		return nil, nil // empty array, not an error
+	}
+	if e.kind != "stream" {
+		return nil, ErrWrongType
+	}
+
+	found := e.stream.Filter(startID, endID)
+	out := make([]StreamEntry, len(found))
+	copy(out, found)
+	return out, nil
 }
 
 func (s *store) cancelWait(keys []string, ch chan popped) (popped, bool) {
@@ -313,6 +390,22 @@ func (e entry) expired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
 }
 
+func parseID(s string) (StreamID, error) {
+	msStr, seqStr, ok := strings.Cut(s, "-")
+	if !ok {
+		return StreamID{}, ErrInvalidID
+	}
+	ms, err := strconv.ParseUint(msStr, 10, 64)
+	if err != nil {
+		return StreamID{}, ErrInvalidID
+	}
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		return StreamID{}, ErrInvalidID
+	}
+	return StreamID{ms, seq}, nil
+}
+
 func isValidStreamId(lastId StreamID, newId StreamID) bool {
 	if newId.Ms < lastId.Ms {
 		return false
@@ -323,4 +416,44 @@ func isValidStreamId(lastId StreamID, newId StreamID) bool {
 	}
 
 	return true
+}
+
+func nextSeq(ms uint64, last StreamID) uint64 {
+	if ms == last.Ms {
+		return last.Seq + 1
+	}
+	if ms == 0 {
+		return 1 // 0-0 is never a valid ID
+	}
+	return 0
+}
+
+func (id StreamID) String() string {
+	return fmt.Sprintf("%d-%d", id.Ms, id.Seq)
+}
+
+func (st Stream) Filter(startId StreamID, endId StreamID) []StreamEntry {
+	entries := st.Entries
+	lo := 0
+
+	for lo < len(entries) && less(entries[lo].ID, startId) {
+		lo++
+	}
+
+	hi := lo
+
+	for hi < len(entries) && !less(endId, entries[hi].ID) {
+		hi++
+	}
+
+	return st.Entries[lo:hi]
+}
+
+func less(a StreamID, b StreamID) bool {
+	if a.Ms != b.Ms {
+		return a.Ms < b.Ms
+	}
+
+	return a.Seq < b.Seq
+
 }
