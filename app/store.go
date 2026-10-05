@@ -17,6 +17,7 @@ var (
 	ErrIDZero     = errors.New("ERR The ID specified in XADD must be greater than 0-0")
 	ErrIDTooSmall = errors.New("ERR The ID specified in XADD is equal or smaller than the target stream top item")
 	ErrInvalidID  = errors.New("ERR Invalid stream ID specified as stream command argument")
+	ErrNotInteger = errors.New("ERR value is not an integer or out of range")
 )
 
 type entry struct {
@@ -31,9 +32,11 @@ type popped struct {
 	key, value string
 }
 type store struct {
-	mu      sync.RWMutex
-	data    map[string]entry
-	waiters map[string][]chan popped
+	mu       sync.RWMutex
+	data     map[string]entry
+	waiters  map[string][]chan popped
+	notify   chan struct{}
+	watchers map[string][]*transaction
 }
 
 type StreamID struct {
@@ -51,12 +54,13 @@ type Stream struct {
 }
 
 func newStore() *store {
-	return &store{data: make(map[string]entry), waiters: make(map[string][]chan popped)}
+	return &store{data: make(map[string]entry), waiters: make(map[string][]chan popped), notify: make(chan struct{}), watchers: make(map[string][]*transaction)}
 }
 
 func (s *store) Set(key string, value string, expiresAt time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.markWatchersLocked(key)
 	s.data[key] = entry{value: value, expiresAt: expiresAt, kind: "string"}
 }
 
@@ -282,6 +286,9 @@ func (s *store) XAdd(key string, rawID string, fields []string) (string, error) 
 	st.stream.LastID = streamId
 	s.data[key] = st
 
+	close(s.notify)
+	s.notify = make(chan struct{})
+
 	return streamId.String(), nil
 }
 
@@ -326,6 +333,159 @@ func (s *store) XRange(key string, start string, end string) ([]StreamEntry, err
 	out := make([]StreamEntry, len(found))
 	copy(out, found)
 	return out, nil
+}
+
+func (s *store) XRead(keys []string, rawIDs []string) ([]streamResult, error) {
+	afters := make([]StreamID, len(keys))
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for i, k := range keys {
+		if rawIDs[i] == "$" {
+			if e, ok := s.data[k]; ok && e.kind == "stream" {
+				afters[i] = e.stream.LastID
+			}
+		} else {
+			id, err := parseID(rawIDs[i])
+			if err != nil {
+				s.mu.Unlock()
+				return nil, err
+			}
+			afters[i] = id
+		}
+	}
+
+	var out []streamResult
+
+	for i, k := range keys {
+		entries := s.readAfterLocked(k, afters[i])
+		if len(entries) > 0 {
+			out = append(out, streamResult{key: k, entries: entries})
+		}
+	}
+
+	return out, nil
+}
+
+func (s *store) XReadBlock(ctx context.Context, keys []string, rawIDs []string, timeout time.Duration) []streamResult {
+	afters := make([]StreamID, len(keys))
+
+	var timeoutCh <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timeoutCh = t.C
+	}
+
+	s.mu.Lock()
+
+	for i, k := range keys {
+		if rawIDs[i] == "$" {
+			if e, ok := s.data[k]; ok && e.kind == "stream" {
+				afters[i] = e.stream.LastID
+			}
+		} else {
+			id, err := parseID(rawIDs[i])
+			if err != nil {
+				s.mu.Unlock()
+				return nil
+			}
+
+			afters[i] = id
+		}
+	}
+
+	s.mu.Unlock()
+
+	for {
+		s.mu.Lock()
+		var out []streamResult
+		for i, k := range keys {
+			if found := s.readAfterLocked(k, afters[i]); len(found) > 0 {
+				out = append(out, streamResult{k, found})
+			}
+		}
+
+		if len(out) > 0 {
+			s.mu.Unlock()
+			return out
+		}
+
+		ch := s.notify
+		s.mu.Unlock()
+
+		select {
+		case <-ch:
+			// nothing here
+		case <-timeoutCh:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (s *store) Increment(key string) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.data[key]
+	if ok && e.kind != "string" {
+		return 0, ErrWrongType
+	}
+
+	var v int64
+	if ok {
+		var err error
+		v, err = strconv.ParseInt(e.value, 10, 64)
+		if err != nil {
+			return 0, ErrNotInteger
+		}
+	}
+	v++
+
+	e.kind = "string"
+	e.value = strconv.FormatInt(v, 10)
+	s.data[key] = e
+	s.markWatchersLocked(key)
+	return v, nil
+}
+
+func (s *store) Watch(tx *transaction, keys []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, key := range keys {
+		s.watchers[key] = append(s.watchers[key], tx)
+		tx.watched = append(tx.watched, key)
+	}
+}
+
+func (s *store) CheckDirty(tx *transaction) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return tx.dirty
+}
+
+func (s *store) Unwatch(tx *transaction) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, k := range tx.watched {
+		queue := s.watchers[k]
+
+		out := queue[:0]
+
+		for _, w := range queue {
+			if w != tx {
+				delete(s.watchers, k)
+			} else {
+				s.watchers[k] = out
+			}
+		}
+		tx.watched = nil
+		tx.dirty = false
+	}
 }
 
 func (s *store) cancelWait(keys []string, ch chan popped) (popped, bool) {
@@ -381,17 +541,42 @@ func (s *store) evictExpired() {
 	now := time.Now()
 	for k, e := range s.data {
 		if !e.expiresAt.IsZero() && now.After(e.expiresAt) {
+			s.markWatchersLocked(k)
 			delete(s.data, k)
 		}
+	}
+}
+
+func (s *store) readAfterLocked(key string, after StreamID) []StreamEntry {
+	e, ok := s.data[key]
+	if !ok || e.kind != "stream" {
+		return nil
+	}
+
+	entries := e.stream.Entries
+
+	i := 0
+	for i < len(entries) && !less(after, entries[i].ID) {
+		i++
+	}
+
+	out := make([]StreamEntry, len(entries)-i)
+	copy(out, entries[i:])
+	return out
+}
+
+func (s *store) markWatchersLocked(key string) {
+	for _, tx := range s.watchers[key] {
+		tx.dirty = true
 	}
 }
 
 func (e entry) expired(now time.Time) bool {
 	return !e.expiresAt.IsZero() && now.After(e.expiresAt)
 }
-
 func parseID(s string) (StreamID, error) {
 	msStr, seqStr, ok := strings.Cut(s, "-")
+
 	if !ok {
 		return StreamID{}, ErrInvalidID
 	}
@@ -418,6 +603,10 @@ func isValidStreamId(lastId StreamID, newId StreamID) bool {
 	return true
 }
 
+func (id StreamID) String() string {
+	return fmt.Sprintf("%d-%d", id.Ms, id.Seq)
+}
+
 func nextSeq(ms uint64, last StreamID) uint64 {
 	if ms == last.Ms {
 		return last.Seq + 1
@@ -426,10 +615,6 @@ func nextSeq(ms uint64, last StreamID) uint64 {
 		return 1 // 0-0 is never a valid ID
 	}
 	return 0
-}
-
-func (id StreamID) String() string {
-	return fmt.Sprintf("%d-%d", id.Ms, id.Seq)
 }
 
 func (st Stream) Filter(startId StreamID, endId StreamID) []StreamEntry {
@@ -455,5 +640,4 @@ func less(a StreamID, b StreamID) bool {
 	}
 
 	return a.Seq < b.Seq
-
 }

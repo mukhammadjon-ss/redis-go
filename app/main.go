@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -17,8 +21,17 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/app/resp"
 )
 
-func handleClient(ctx context.Context, conn net.Conn, db *store) {
+type transaction struct {
+	active  bool
+	queued  [][][]byte
+	watched []string
+	dirty   bool
+}
+
+func handleClient(ctx context.Context, conn net.Conn, db *store, srv *server) {
 	defer conn.Close()
+	defer srv.replicas.remove(conn)
+
 	watchDone := make(chan struct{})
 	defer close(watchDone)
 	go func() {
@@ -29,6 +42,7 @@ func handleClient(ctx context.Context, conn net.Conn, db *store) {
 		}
 	}()
 	r := resp.NewReader(conn)
+	var tx transaction
 
 	for {
 		cmd, err := r.ReadCommand()
@@ -40,217 +54,129 @@ func handleClient(ctx context.Context, conn net.Conn, db *store) {
 			return
 		}
 
-		switch strings.ToUpper(string(cmd[0])) {
-		case "PING":
-			conn.Write([]byte("+PONG\r\n"))
+		commandName := strings.ToUpper(string(cmd[0]))
 
-		case "ECHO":
-			if len(cmd) != 2 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'echo' command\r\n"))
-				continue
-			}
-			arg := cmd[1]
-			conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg)))
+		if tx.active && commandName != "MULTI" && commandName != "EXEC" && commandName != "DISCARD" && commandName != "WATCH" {
+			tx.queued = append(tx.queued, cmd)
+			conn.Write([]byte("+QUEUED\r\n"))
+			continue
+		}
 
-		case "SET":
-			if len(cmd) < 3 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'set' command\r\n"))
+		switch commandName {
+		case "MULTI":
+			if tx.active {
 				continue
 			}
 
-			var expiresAt time.Time // zero value: no expiry
-
-			if len(cmd) > 3 {
-				opts := cmd[3:]
-				if len(opts) != 2 || strings.ToUpper(string(opts[0])) != "PX" {
-					conn.Write([]byte("-ERR syntax error\r\n"))
-					continue
-				}
-				ms, err := strconv.ParseInt(string(opts[1]), 10, 64)
-				if err != nil || ms < 0 {
-					conn.Write([]byte("-ERR value is not an integer or out of range\r\n"))
-					continue
-				}
-				expiresAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
-			}
-
-			db.Set(string(cmd[1]), string(cmd[2]), expiresAt)
+			tx.active = true
 			conn.Write([]byte("+OK\r\n"))
 
-		case "GET":
-			got, ok := db.Get(string(cmd[1]))
-			if !ok {
-				conn.Write([]byte("$-1\r\n"))
+		case "EXEC":
+			if !tx.active {
+				conn.Write([]byte("-ERR EXEC without MULTI\r\n"))
 				continue
 			}
 
-			conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(got), got)))
-			continue
+			aborted := db.CheckDirty(&tx)
+			db.Unwatch(&tx)
 
-		case "RPUSH":
-			if len(cmd) < 3 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'rpush' command\r\n"))
-				continue
-			}
-			raw := cmd[2:]
-			values := make([]string, len(raw))
-			for i, b := range raw {
-				values[i] = string(b)
-			}
-			n := db.RPush(string(cmd[1]), values...)
-			conn.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
-			continue
+			queued := tx.queued
+			tx = transaction{}
 
-		case "LPUSH":
-			if len(cmd) < 3 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'rpush' command\r\n"))
-				continue
-			}
-			raw := cmd[2:]
-			values := make([]string, len(raw))
-			for i, b := range raw {
-				values[i] = string(b)
-			}
-			n := db.LPush(string(cmd[1]), values...)
-			conn.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
-			continue
-
-		case "LRANGE":
-			if len(cmd) != 4 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'lrange' command\r\n"))
-				continue
-			}
-
-			start, _ := strconv.Atoi(string(cmd[2]))
-			end, _ := strconv.Atoi(string(cmd[3]))
-
-			slice := db.LRange(string(cmd[1]), start, end)
-			if len(slice) == 0 {
-				conn.Write([]byte("*0\r\n"))
-				continue
-			}
-
-			var b strings.Builder
-			fmt.Fprintf(&b, "*%d\r\n", len(slice))
-			for _, item := range slice {
-				fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(item), item)
-			}
-			conn.Write([]byte(b.String()))
-
-		case "LLEN":
-			n := db.LLen(string(cmd[1]))
-			conn.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
-			continue
-
-		case "LPOP":
-			withCount := len(cmd) >= 3
-			n := 1
-			if withCount {
-				n, err = strconv.Atoi(string(cmd[2]))
-
-				if err != nil || n < 0 {
-					conn.Write([]byte(fmt.Sprintf("$-1\r\n")))
-					continue
-				}
-			}
-			ans, ok := db.LPop(string(cmd[1]), n)
-			if !ok {
-				conn.Write([]byte(fmt.Sprintf("$-1\r\n")))
-				continue
-			}
-
-			if !withCount {
-				conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(ans[0]), ans[0])))
-				continue
-			}
-			writeArray(conn, ans)
-			continue
-
-		case "BLPOP":
-			if len(cmd) < 3 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'blpop' command\r\n"))
-				continue
-			}
-
-			secs, err := strconv.ParseFloat(string(cmd[len(cmd)-1]), 64)
-			if err != nil || secs < 0 {
-				conn.Write([]byte("-ERR timeout is not a float or out of range\r\n"))
-				continue
-			}
-
-			keys := make([]string, 0, len(cmd)-2)
-			for _, k := range cmd[1 : len(cmd)-1] {
-				keys = append(keys, string(k))
-			}
-
-			p, ok := db.BLpop(ctx, keys, time.Duration(secs*float64(time.Second)))
-			if !ok {
+			if aborted {
 				conn.Write([]byte("*-1\r\n"))
 				continue
 			}
-			writeArray(conn, []string{p.key, p.value})
+			conn.Write([]byte("*" + strconv.Itoa(len(queued)) + "\r\n"))
+			for _, c := range queued {
+				handleCommands(ctx, conn, db, srv, c)
+			}
+		case "DISCARD":
+			if !tx.active {
+				conn.Write([]byte("-ERR DISCARD without MULTI\r\n"))
+				continue
+			}
 
-		case "TYPE":
+			tx = transaction{}
+			conn.Write([]byte("+OK\r\n"))
+		case "WATCH":
 			if len(cmd) < 2 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'blpop' command\r\n"))
+				conn.Write([]byte("-ERR wrong number of arguments for 'watch' command\r\n"))
 				continue
 			}
 
-			p, ok := db.EntryType(string(cmd[1]))
-			if !ok {
-				conn.Write([]byte("+none\r\n"))
+			if tx.active {
+				conn.Write([]byte("-ERR WATCH inside MULTI is not allowed\r\n"))
 				continue
 			}
 
-			conn.Write([]byte("+" + p + "\r\n"))
+			keys := make([]string, 0, len(cmd)-1)
 
-		case "XADD":
-			if len(cmd) < 5 || (len(cmd)-3)%2 != 0 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'XADD' command\r\n"))
+			for _, k := range cmd[1:] {
+				keys = append(keys, string(k))
+			}
+			db.Watch(&tx, keys)
+			conn.Write([]byte("+OK\r\n"))
+
+		case "UNWATCH":
+			db.Unwatch(&tx)
+			conn.Write([]byte("+OK\r\n"))
+
+		case "PSYNC":
+			log.Println("PSYNC received")
+			const emptyRDBHex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2"
+
+			var emptyRDB = func() []byte {
+				b, err := hex.DecodeString(emptyRDBHex)
+				if err != nil {
+					panic(err)
+				}
+
+				return b
+			}()
+
+			body := fmt.Sprintf("+FULLRESYNC %s %d\r\n", srv.replicationId, 0)
+			conn.Write([]byte(body))
+
+			conn.Write([]byte(fmt.Sprintf("$%d\r\n", len(emptyRDB))))
+			conn.Write(emptyRDB)
+
+			srv.replicas.add(conn)
+
+		case "REPLCONF":
+			if len(cmd) >= 3 && strings.EqualFold(string(cmd[1]), "ACK") {
+				offset, err := strconv.ParseInt(string(cmd[2]), 10, 64)
+				if err == nil {
+					srv.replicas.ack(conn, offset)
+				}
 				continue
 			}
 
-			// streamId, err := parseID(string(cmd[2]))
-			if err != nil {
-				conn.Write([]byte("-ERR stream ID is invalid\r\n"))
-				continue
+			conn.Write([]byte("+OK\r\n"))
+
+		case "WAIT":
+			if len(cmd) < 3 {
+				conn.Write([]byte("-ERR invalid number of arguments for 'wait'\r\n"))
 			}
 
-			var fields []string
+			// target := srv.replicas.currentOffset()
 
-			for _, v := range cmd[3:] {
-				fields = append(fields, string(v))
-			}
-			e, err := db.XAdd(string(cmd[1]), string(cmd[2]), fields)
-			if err != nil {
-				conn.Write([]byte("-" + err.Error() + "\r\n"))
-				continue
-			}
+			numOfReplicas, _ := strconv.Atoi(string(cmd[1]))
+			timeoutInt, _ := strconv.Atoi(string(cmd[2]))
 
-			conn.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(e), e)))
-		case "XRANGE":
-			if len(cmd) < 4 {
-				conn.Write([]byte("-ERR wrong number of arguments for 'xrange' command\r\n"))
-				continue
-			}
+			n := srv.replicas.wait(numOfReplicas, time.Duration(timeoutInt)*time.Millisecond)
+			conn.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
 
-			key := string(cmd[1])
-			start := string(cmd[2])
-			end := string(cmd[3])
-
-			entries, err := db.XRange(key, start, end)
-			if err != nil {
-				conn.Write([]byte("-ERR " + err.Error() + "\r\n"))
-			}
-
-			writeStream(conn, entries)
 		default:
-			conn.Write([]byte("-ERR unknown command '" + string(cmd[0]) + "'\r\n"))
+			handleCommands(ctx, conn, db, srv, cmd)
+			if writeCommands[commandName] {
+				srv.replicas.propagate(cmd)
+			}
 		}
 	}
 }
 
-func writeStream(conn net.Conn, entries []StreamEntry) {
+func writeStream(w io.Writer, entries []StreamEntry) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "*%d\r\n", len(entries))
 
@@ -266,10 +192,43 @@ func writeStream(conn net.Conn, entries []StreamEntry) {
 		}
 	}
 
-	conn.Write([]byte(b.String()))
+	w.Write([]byte(b.String()))
 }
 
-func writeArray(conn net.Conn, popped []string) {
+type streamResult struct {
+	key     string
+	entries []StreamEntry
+}
+
+func writeXRead(w io.Writer, results []streamResult) {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "*%d\r\n", len(results)) // one per stream key
+
+	for _, r := range results {
+		b.WriteString("*2\r\n") // [key, entries]
+		bulk(&b, r.key)
+
+		fmt.Fprintf(&b, "*%d\r\n", len(r.entries)) // the entries array
+		for _, e := range r.entries {
+			b.WriteString("*2\r\n") // [id, fields]
+			bulk(&b, e.ID.String())
+
+			fmt.Fprintf(&b, "*%d\r\n", len(e.Fields))
+			for _, f := range e.Fields {
+				bulk(&b, f)
+			}
+		}
+	}
+
+	w.Write([]byte(b.String()))
+}
+
+func bulk(b *strings.Builder, s string) {
+	fmt.Fprintf(b, "$%d\r\n%s\r\n", len(s), s)
+}
+
+func writeArray(w io.Writer, popped []string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "*%d\r\n", len(popped))
 
@@ -277,14 +236,39 @@ func writeArray(conn net.Conn, popped []string) {
 		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(item), item)
 	}
 
-	conn.Write([]byte(b.String()))
+	w.Write([]byte(b.String()))
+}
+
+func encodeCommand(args ...string) []byte {
+	var b strings.Builder
+	fmt.Fprintf(&b, "*%d\r\n", len(args))
+
+	for _, arg := range args {
+		fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(arg), arg)
+	}
+
+	return []byte(b.String())
 }
 
 func main() {
+	port := flag.Int("port", 6379, "port to listen on")
+	replicaOf := flag.String("replicaof", "", "indicating service is replica")
+	flag.Parse()
+
+	srv := &server{
+		port:              *port,
+		replicaof:         *replicaOf,
+		isReplica:         *replicaOf != "",
+		replicas:          &replicaSet{ackCh: make(chan struct{})},
+		replicationId:     "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+		replicationOffset: 0,
+	}
+
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 	fmt.Println("Logs from your program will appear here!")
 	db := newStore()
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
 		fmt.Println("Failed to bind to port 6379")
 		os.Exit(1)
@@ -305,6 +289,21 @@ func main() {
 	var wg sync.WaitGroup
 	db.startSweeper(ctx, 100*time.Millisecond, &wg)
 
+	if srv.isReplica {
+		host, port, ok := strings.Cut(*replicaOf, " ")
+		if !ok {
+			log.Fatal("--replicaof must be \"<host> <port>\"")
+		}
+		srv.master_host = host
+		srv.master_port = port
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			startReplication(ctx, srv, db)
+		}()
+	}
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
@@ -322,7 +321,8 @@ func main() {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			handleClient(ctx, c, db)
+			handleClient(ctx, c, db, srv)
 		}(conn)
+		// go handleClient(conn, db)
 	}
 }
