@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +56,7 @@ func handleCommands(ctx context.Context, w io.Writer, db *store, srv *server, cm
 		}
 
 		db.Set(string(cmd[1]), string(cmd[2]), expiresAt)
+		// aofSync(aof, cmd)
 		w.Write([]byte("+OK\r\n"))
 
 	case "GET":
@@ -311,8 +315,360 @@ func handleCommands(ctx context.Context, w io.Writer, db *store, srv *server, cm
 		writeXRead(w, results)
 
 	case "INFO":
-		body := fmt.Sprintf("# Replication\r\nrole:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", srv.role(), srv.replicationId, 0)
+		body := fmt.Sprintf("# Replication\r\nrole:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", srv.role(), srv.replicationID, 0)
 		w.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(body), body)))
+
+	case "KEYS":
+		pattern := string(cmd[1])
+
+		keys := db.Keys(pattern)
+
+		bulkString(w, keys...)
+
+	case "CONFIG":
+		if len(cmd) < 3 {
+			w.Write([]byte("-ERR invalid number of arguments for 'config'\r\n"))
+			return
+		}
+		if len(cmd) >= 3 && strings.EqualFold(string(cmd[1]), "GET") {
+			v := string(cmd[2])
+
+			if v == "dir" {
+				bulkString(w, "dir", srv.cfg.dir)
+			} else if v == "dbfilename" {
+				bulkString(w, "dbfilename", srv.cfg.dbFilename)
+			} else if v == "appenddirname" {
+				bulkString(w, "appenddirname", srv.cfg.appenddirname)
+			} else if v == "appendonly" {
+				appendonly := "no"
+				if srv.cfg.appendOnly {
+					appendonly = "yes"
+				}
+				bulkString(w, "appendonly", appendonly)
+			} else if v == "appendfilename" {
+				bulkString(w, "appendfilename", srv.cfg.appendFilename)
+			} else if v == "appendfsync" {
+				bulkString(w, "appendfsync", srv.cfg.appendFsync)
+			}
+		}
+
+	case "ZADD":
+		if len(cmd) < 4 {
+			w.Write([]byte("-ERR invalid number of arguments for 'zadd'\r\n"))
+			return
+		}
+
+		zsetKey := string(cmd[1])
+		score, _ := strconv.ParseFloat(string(cmd[2]), 64)
+		member := string(cmd[3])
+
+		n, err := db.ZAdd(zsetKey, score, member)
+		if err != nil {
+			w.Write([]byte("-ERR " + err.Error() + "\r\n"))
+			return
+		}
+
+		w.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
+
+	case "ZRANK":
+		if len(cmd) < 3 {
+			w.Write([]byte("-ERR invalid number of arguments for 'zrange'\r\n"))
+			return
+		}
+
+		rank := db.ZRank(string(cmd[1]), string(cmd[2]))
+		if rank == -1 {
+			w.Write([]byte("$-1\r\n"))
+			return
+		}
+
+		w.Write([]byte(fmt.Sprintf(":%d\r\n", rank)))
+
+	case "ZRANGE":
+		if len(cmd) < 4 {
+			w.Write([]byte("-ERR invalid number of arguments for 'zrange'\r\n"))
+			return
+		}
+
+		key := string(cmd[1])
+		start, _ := strconv.Atoi(string(cmd[2]))
+		stop, _ := strconv.Atoi(string(cmd[3]))
+
+		scores := db.ZRange(key, start, stop)
+
+		bulkString(w, scores...)
+
+	case "ZCARD":
+		n := db.ZCard(string(cmd[1]))
+		w.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
+
+	case "ZSCORE":
+		if len(cmd) < 3 {
+			w.Write([]byte("-ERR invalid number of arguments for 'zscore'\r\n"))
+			return
+		}
+
+		score := db.ZScore(string(cmd[1]), string(cmd[2]))
+		if score == "" {
+			w.Write([]byte("$-1\r\n"))
+			return
+		}
+
+		w.Write([]byte(fmt.Sprintf("$%d\r\n%s\r\n", len(score), score)))
+
+	case "ZREM":
+		if len(cmd) < 3 {
+			w.Write([]byte("-ERR invalid number of arguments for 'zrem'\r\n"))
+			return
+		}
+
+		n := db.ZRem(string(cmd[1]), string(cmd[2]))
+		w.Write([]byte(fmt.Sprintf(":%d\r\n", n)))
+
+	case "SETBIT":
+		if len(cmd) != 4 {
+			w.Write([]byte("-ERR wrong number of arguments for 'setbit' command\r\n"))
+			return
+		}
+		offset, err := strconv.ParseUint(string(cmd[2]), 10, 64)
+		if err != nil {
+			w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+			return
+		}
+		value, err := strconv.Atoi(string(cmd[3]))
+		if err != nil {
+			w.Write([]byte("-" + ErrBitValue.Error() + "\r\n"))
+			return
+		}
+		old, err := db.SetBit(string(cmd[1]), offset, value)
+		if err != nil {
+			w.Write([]byte("-" + err.Error() + "\r\n"))
+			return
+		}
+		fmt.Fprintf(w, ":%d\r\n", old)
+
+	case "GETBIT":
+		if len(cmd) != 3 {
+			w.Write([]byte("-ERR wrong number of arguments for 'getbit' command\r\n"))
+			return
+		}
+		offset, err := strconv.ParseUint(string(cmd[2]), 10, 64)
+		if err != nil {
+			w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+			return
+		}
+		bit, err := db.GetBit(string(cmd[1]), offset)
+		if err != nil {
+			w.Write([]byte("-" + err.Error() + "\r\n"))
+			return
+		}
+		fmt.Fprintf(w, ":%d\r\n", bit)
+
+	case "STRLEN":
+		if len(cmd) != 2 {
+			w.Write([]byte("-ERR wrong number of arguments for 'getbit' command\r\n"))
+			return
+		}
+
+		key := string(cmd[1])
+
+		l, err := db.Strlen(key)
+		if err != nil {
+			w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+			return
+		}
+		fmt.Fprintf(w, ":%d\r\n", l)
+
+	case "BITCOUNT":
+		if len(cmd) < 2 {
+			w.Write([]byte("-ERR wrong number of arguments for 'getbit' command\r\n"))
+			return
+		}
+
+		count := 0
+		if len(cmd) < 3 {
+			count = db.CountBit(string(cmd[1]), 0, 0)
+			fmt.Fprintf(w, ":%d\r\n", count)
+			return
+		}
+
+		start, err := strconv.Atoi(string(cmd[2]))
+		if err != nil {
+			w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+			return
+		}
+		stop, err := strconv.Atoi(string(cmd[3]))
+		if err != nil {
+			w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+			return
+		}
+
+		count = db.CountBit(string(cmd[1]), start, stop)
+
+		fmt.Fprintf(w, ":%d\r\n", count)
+
+	case "BITOP":
+		if string(cmd[1]) == "AND" {
+			destKey := string(cmd[2])
+			key1 := string(cmd[3])
+			key2 := string(cmd[4])
+
+			n, err := db.BitOpAnd(destKey, key1, key2)
+
+			if err != nil {
+				w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+				return
+			}
+
+			fmt.Fprintf(w, ":%d\r\n", n)
+		} else if string(cmd[1]) == "OR" {
+			destKey := string(cmd[2])
+			key1 := string(cmd[3])
+			key2 := string(cmd[4])
+
+			n, err := db.BitOpOr(destKey, key1, key2)
+
+			if err != nil {
+				w.Write([]byte("-" + ErrBitOffset.Error() + "\r\n"))
+				return
+			}
+
+			fmt.Fprintf(w, ":%d\r\n", n)
+		}
+
+	case "GEOADD":
+		if len(cmd) < 5 {
+			w.Write([]byte("-ERR invalid number of arguments for 'geoadd'\r\n"))
+			return
+		}
+
+		key := string(cmd[1])
+		long, _ := strconv.ParseFloat(string(cmd[2]), 64)
+		lat, _ := strconv.ParseFloat(string(cmd[3]), 64)
+		member := string(cmd[4])
+
+		n, err := db.GeoAdd(key, long, lat, member)
+		if err != nil {
+			fmt.Fprintf(w, "-%s\r\n", err.Error())
+			return
+		}
+
+		fmt.Fprintf(w, ":%d\r\n", n)
+
+	case "GEOPOS":
+		if len(cmd) < 3 {
+			w.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
+			return
+		}
+
+		members := make([]string, len(cmd)-2)
+		for i, m := range cmd[2:] {
+			members[i] = string(m)
+		}
+
+		found, err := db.GeoExists(string(cmd[1]), members)
+		if err != nil {
+			w.Write([]byte("-" + err.Error() + "\r\n"))
+			return
+		}
+
+		var b strings.Builder
+		fmt.Fprintf(&b, "*%d\r\n", len(members)) // one entry per member requested
+		for _, loc := range found {
+			if len(loc) == 0 {
+				b.WriteString("*-1\r\n") // null array, not $-1
+				continue
+			}
+			b.WriteString("*2\r\n")
+			bulk(&b, loc[0]) // longitude, hardcoded for this stage
+			bulk(&b, loc[1]) // latitude
+		}
+		w.Write([]byte(b.String()))
+
+	case "GEODIST":
+		if len(cmd) < 4 {
+			w.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
+			return
+		}
+
+		members := make([]string, len(cmd)-2)
+		for i, m := range cmd[2:] {
+			members[i] = string(m)
+		}
+
+		dist := db.GeoDist(string(cmd[1]), members)
+
+		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(dist), dist)
+
+	case "GEOSEARCH":
+		if len(cmd) < 8 {
+			w.Write([]byte("-ERR wrong number of arguments for 'geopos' command\r\n"))
+			return
+		}
+
+		key := string(cmd[1])
+		var long, lat, byRadius float64
+		if string(cmd[2]) == "FROMLONLAT" {
+			long, _ = strconv.ParseFloat(string(cmd[3]), 64)
+			lat, _ = strconv.ParseFloat(string(cmd[4]), 64)
+			if string(cmd[5]) == "BYRADIUS" {
+				byRadius, _ = strconv.ParseFloat(string(cmd[6]), 64)
+			}
+		}
+
+		locations := db.GeoSearch(key, long, lat, byRadius)
+
+		var b strings.Builder
+
+		fmt.Fprintf(&b, "*%d\r\n", len(locations))
+		for _, loc := range locations {
+			bulk(&b, loc)
+		}
+
+		w.Write([]byte(b.String()))
+
+	case "ACL":
+		switch strings.ToUpper(string(cmd[1])) {
+		case "WHOAMI":
+			user := srv.getUser("default")
+			fmt.Fprintf(w, "$%d\r\n%s\r\n", len(user.name), user.name)
+			return
+		case "GETUSER":
+			user := srv.getUser("default")
+			var b strings.Builder
+			// flags := []string{"nopass"}
+			// passwords := []string{}
+
+			b.WriteString("*4\r\n")
+			b.WriteString("$5\r\nflags\r\n")
+			b.WriteString(fmt.Sprintf("*%d\r\n", len(user.flags)))
+
+			for _, flag := range user.flags {
+				bulk(&b, flag)
+			}
+			b.WriteString("$9\r\npasswords\r\n")
+			b.WriteString(fmt.Sprintf("*%d\r\n", len(user.passwords)))
+			for _, password := range user.passwords {
+				bulk(&b, password)
+			}
+
+			w.Write([]byte(b.String()))
+
+		case "SETUSER":
+			user := srv.getUser("default")
+			//
+			if pw, ok := strings.CutPrefix(string(cmd[3]), ">"); ok {
+				sum := sha256.Sum256([]byte(pw))
+				hash := hex.EncodeToString(sum[:])
+
+				user.passwords = append(user.passwords, hash)
+				user.flags = slices.DeleteFunc(user.flags, func(f string) bool {
+					return f == "nopass"
+				})
+			}
+
+			w.Write([]byte("+OK\r\n"))
+		}
 	default:
 		w.Write([]byte("-ERR unknown command '" + string(cmd[0]) + "'\r\n"))
 	}

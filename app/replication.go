@@ -14,16 +14,6 @@ import (
 	"github.com/codecrafters-io/redis-starter-go/app/resp"
 )
 
-type server struct {
-	isReplica         bool
-	port              int
-	replicaof         string
-	master_host       string
-	master_port       string
-	replicas          *replicaSet
-	replicationId     string
-	replicationOffset int64
-}
 type replicaSet struct {
 	mu       sync.Mutex
 	replicas []*replica
@@ -44,10 +34,11 @@ var writeCommands = map[string]bool{
 	"LPOP":  true,
 	"BLPOP": true,
 	"XADD":  true,
+	"ZADD":  true,
 }
 
 func (s *server) role() string {
-	if s.isReplica {
+	if s.cfg.isReplica {
 		return "slave"
 	}
 
@@ -163,7 +154,7 @@ func (r *replicaSet) currentOffset() int64 {
 }
 
 func startReplication(ctx context.Context, srv *server, db *store) {
-	addr := net.JoinHostPort(srv.master_host, srv.master_port)
+	addr := net.JoinHostPort(srv.cfg.masterHost, srv.cfg.masterPort)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		log.Println("connect to master:", err)
@@ -184,7 +175,7 @@ func startReplication(ctx context.Context, srv *server, db *store) {
 		return
 	}
 
-	if _, err := conn.Write(encodeCommand("REPLCONF", "listening-port", strconv.Itoa(srv.port))); err != nil {
+	if _, err := conn.Write(encodeCommand("REPLCONF", "listening-port", strconv.Itoa(srv.cfg.port))); err != nil {
 		log.Println("handshake replconf:", err)
 		return
 	}
